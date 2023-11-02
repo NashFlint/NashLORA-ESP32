@@ -1,6 +1,5 @@
 #include "NashLORA.h"
 
-
 // definitions - undecided if these should go here or in header
 
 // register addresses - notes are for info or maybe for future development
@@ -51,11 +50,11 @@
 // add more defines here for needed things possibly, like writing certain registers in repeated ways
 
 // pins for LORA
-#define PIN_MISO    GPIO_NUM_37
-#define PIN_MOSI    GPIO_NUM_35
-#define PIN_SCK     GPIO_NUM_36
-#define PIN_CS      GPIO_NUM_38
-#define PIN_RST     GPIO_NUM_47
+#define PIN_MISO    GPIO_NUM_13
+#define PIN_MOSI    GPIO_NUM_11
+#define PIN_SCK     GPIO_NUM_12
+//#define PIN_CS      GPIO_NUM_10
+//#define PIN_RST     GPIO_NUM_8
 
 // register settings for different modes - these are set to always keep the device in LoRa long range mode
 #define MODE_SLEEP 0x80
@@ -71,15 +70,23 @@
 
 #define SPI_HOST_ID SPI2_HOST // this can be changed to support more SPI devices, probably unneeded
 
+static const char *TAG = "LORA_DEBUG";
+
+NashLORA::NashLORA(gpio_num_t cs, gpio_num_t rst)
+{
+    csPin = cs;
+    rstPin = rst;
+}
+
 bool NashLORA::init()
 {
     // prep pins
-    gpio_reset_pin(PIN_RST);
-    gpio_reset_pin(PIN_CS);
+    gpio_reset_pin(rstPin);
+    gpio_reset_pin(csPin);
 
-    gpio_set_direction(PIN_RST, GPIO_MODE_OUTPUT);
-    gpio_set_direction(PIN_CS, GPIO_MODE_OUTPUT);
-    gpio_set_level(PIN_CS, 1); // this line of code may be communist
+    gpio_set_direction(rstPin, GPIO_MODE_OUTPUT);
+    gpio_set_direction(csPin, GPIO_MODE_OUTPUT);
+    gpio_set_level(csPin, 1); // this line of code may be communist
 
     // config and initialize SPI
     spi_bus_config_t busConfig = {
@@ -94,7 +101,7 @@ bool NashLORA::init()
     spi_device_interface_config_t devConfig = {
         .mode = 0,
         .clock_speed_hz = 9000000,
-        .spics_io_num = PIN_CS,
+        .spics_io_num = csPin,
         .flags = 0,
         .queue_size = 7,
         .pre_cb = NULL,
@@ -110,6 +117,8 @@ bool NashLORA::init()
     uint8_t version;
     version = readRegister(REG_VERSION);
 
+    //ESP_LOGI(TAG, "Version: %02x", version);
+
     // debug
 
     if (version != 0x12)
@@ -121,7 +130,7 @@ bool NashLORA::init()
     sleep();
 
     // set default parameters
-    setFreq(915);
+    setFreq(915000000);
     setPower(17); // randomly selected default power - this is the max
 
     // reset FIFO to 0
@@ -130,7 +139,12 @@ bool NashLORA::init()
 
     writeRegister(REG_LNA, 0x20 | 0x03); // this line will boost LNA current to %150, not sure if necessary, leaving alone for now
 
-    writeRegister(REG_MODEM_CONFIG_3, 0x04); // set gain to auto
+    enableAGC(false);
+    setGain(1);
+
+    //writeRegister(REG_MODEM_CONFIG_3, 0x04); // set gain to auto
+    //enableAGC(false);
+    //setGain(1);
 
     standby();
 
@@ -140,9 +154,9 @@ bool NashLORA::init()
 
 void NashLORA::reset()
 {
-    gpio_set_level(PIN_RST,0);
-    vTaskDelay(1/portTICK_PERIOD_MS); // according to docs this should be 100us but whatever this probably works
-    gpio_set_level(PIN_RST, 1);
+    gpio_set_level(rstPin,0);
+    vTaskDelay(10/portTICK_PERIOD_MS); // according to docs this should be 100us but whatever this probably works
+    gpio_set_level(rstPin, 1);
     vTaskDelay(10/portTICK_PERIOD_MS); // according to docs this should only me 5ms but do 10ms to be safe
 }
 
@@ -190,9 +204,10 @@ void NashLORA::standby()
     writeRegister(REG_OP_MODE, MODE_STANDBY);
 }
 
-void NashLORA::setFreq(uint32_t freq) // take in freq in mhz
+void NashLORA::setFreq(uint32_t frequency) // take in freq in Hz
 {
-    uint32_t frf = freq * 16384; // simplified conversion from datasheet
+    freq = frequency;
+    uint32_t frf = freq * 0.016384; // simplified conversion from datasheet
 
     // write bytes by shifting and masking
     writeRegister(REG_FR_MSB, frf >> 16 & 0xff);
@@ -225,21 +240,19 @@ void NashLORA::send(uint8_t* buf, uint8_t len)
     {
         writeRegister(REG_FIFO, buf[i]);
     }
-
     writeRegister(REG_PAYLOAD_LEN, len);
 
     // put lora into send mode
     writeRegister(REG_OP_MODE, MODE_TX);
-
     // wait for lora to be done sending by reading flag for completion
     while ((readRegister(REG_IRQ_FLAGS) & IRQ_TX_DONE) == 0)
     {
-        vTaskDelay(2/portTICK_PERIOD_MS);
+        vTaskDelay(10/portTICK_PERIOD_MS);
     }
-
     //reset IRQ flag by writing 1 to bit in register
     writeRegister(REG_IRQ_FLAGS, IRQ_TX_DONE);
-
+    // reset register pointer -> not sure if needed
+    writeRegister(REG_FIFO_ADDR_PTR, 0);
 }
 
 void NashLORA::receive()
@@ -281,4 +294,143 @@ void NashLORA::receivePacket(uint8_t* buf, uint8_t* len) // this function only r
         buf[i] = readRegister(REG_FIFO); 
     }
     receive();
+}
+
+int NashLORA::getPacketRSSI()
+{
+    int rssi;
+    if (freq >= 525000000)
+    {
+        rssi = -157 + readRegister(REG_PACKET_RSSI);
+    }
+    else
+    {
+        rssi = -164 + readRegister(REG_PACKET_RSSI);
+    }
+
+    return rssi;
+}
+
+bool NashLORA::signalDetected()
+{
+    if ((readRegister(REG_MODEM_STAT) & 0b00000001) == 0b00000001)
+    {
+        return true;
+    }
+    return false;
+}
+
+bool NashLORA::signalSynced()
+{
+    if ((readRegister(REG_MODEM_STAT) & 0b00000010) == 0b00000010)
+    {
+        return true;
+    }
+    return false;
+}
+
+bool NashLORA::rxOngoing()
+{
+    if ((readRegister(REG_MODEM_STAT) & 0b00000100) == 0b00000100)
+    {
+        return true;
+    }
+    return false;
+}
+
+bool NashLORA::headerValid()
+{
+    if ((readRegister(REG_MODEM_STAT) & 0b00001000) == 0b00001000)
+    {
+        return true;
+    }
+    return false;
+}
+
+uint32_t NashLORA::getFreq()
+{
+    return freq;
+}
+
+void NashLORA::enableCRC(bool en)
+{
+    uint8_t buf = readRegister(REG_MODEM_CONFIG_2);
+    if (en)
+    {
+        writeRegister(REG_MODEM_CONFIG_2, buf | 0x04);
+    }
+    else
+    {
+        writeRegister(REG_MODEM_CONFIG_2, buf | 0xDF);
+    }
+}
+
+void NashLORA::setGain(uint8_t Gval)
+{
+    // read register
+    uint8_t buf = readRegister(REG_LNA);
+
+    // clear bits for gain numbers
+    for (int i = 5; i <= 7; i++)
+    {
+        buf = buf & ~(1 << i);
+    }
+
+    if (Gval < 1)
+    {
+        Gval = 1;
+    }
+    else if (Gval > 6)
+    {
+        Gval = 6;
+    }
+
+    buf = buf | (Gval << 5);
+
+    writeRegister(REG_LNA, buf);
+}
+
+void NashLORA::enableAGC(bool en)
+{
+    uint8_t buf = readRegister(REG_MODEM_CONFIG_3);
+    if (en)
+    {
+        buf = buf | 1 << 2;
+    }
+    else
+    {
+        buf = buf & ~(1 << 2);
+    }
+
+    writeRegister(REG_MODEM_CONFIG_3, buf);
+}
+
+// These next two functions are faked for now !!!
+void NashLORA::setCodingRate(uint8_t codingRate)
+{
+    if (codingRate > 8)
+    {
+        codingRate = 8;
+    }
+    else if (codingRate < 5)
+    {
+        codingRate = 5;
+    }
+
+    //uint8_t buf = readRegister(REG_MODEM_CONFIG_1);
+
+    // set to CR of 4/6
+    //uint8_t regBuf = 0b01110100;
+
+    // set to bandwidth 125 and CR 4/7
+    uint8_t regBuf = 0b01110110;
+    writeRegister(REG_MODEM_CONFIG_1, regBuf);
+
+}
+
+void NashLORA::setSpreadingFactor(uint8_t spreadingFactor)
+{
+    // set to SF of 10
+    uint8_t regBuf = 0b10100100;
+    writeRegister(REG_MODEM_CONFIG_2, regBuf);
 }
